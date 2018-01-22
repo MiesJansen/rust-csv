@@ -195,7 +195,7 @@ pub use string_record::{StringRecord, StringRecordIter};
 pub use writer::{Writer, WriterBuilder};
 
 mod byte_record;
-mod deserializer;
+pub mod deserializer;
 mod error;
 pub mod cookbook;
 mod reader;

@@ -1,3 +1,7 @@
+//! A module for deserialization.
+//!
+//! Exposed the module specifically to allow for
+//! serde_transcode::transcode(&mut deserializer, &mut serializer).unwrap();
 use std::error::{Error as StdError};
 use std::fmt;
 use std::iter;
@@ -17,6 +21,10 @@ use string_record::{StringRecord, StringRecordIter};
 
 use self::DeserializeErrorKind as DEK;
 
+use reader::{StringRecordsIntoIter,Reader};
+use std::io;
+
+/// Deserializes a StringRecord
 pub fn deserialize_string_record<'de, D: Deserialize<'de>>(
     record: &'de StringRecord,
     headers: Option<&'de StringRecord>,
@@ -34,6 +42,7 @@ pub fn deserialize_string_record<'de, D: Deserialize<'de>>(
     })
 }
 
+/// Deserializes a ByteRecord
 pub fn deserialize_byte_record<'de, D: Deserialize<'de>>(
     record: &'de ByteRecord,
     headers: Option<&'de ByteRecord>,
@@ -48,6 +57,22 @@ pub fn deserialize_byte_record<'de, D: Deserialize<'de>>(
             pos: record.position().map(Clone::clone),
             err: err,
         })
+    })
+}
+
+/// Create a Deserializer from an io::Read
+///
+/// specifically useful for: https://docs.rs/serde-transcode/1.0.0/serde_transcode/
+pub fn from_reader<'r, R: io::Read + 'r> (reader: R) -> DeRecordWrap<DeStringRecords<'r, R>> {
+    let rdr = Reader::from_reader(reader);
+    let its = rdr.into_records().peekable();
+    let rec = if let rec = Some(its.next()) { Some(rec.unwrap().unwrap().unwrap()) } else {None};
+    DeRecordWrap(DeStringRecords {
+        its: its,
+        rec: rec,
+        it: rec.unwrap_or(StringRecord::new()).iter().peekable(),
+        headers: if rdr.has_headers() { Some(rdr.headers().unwrap().into_iter()) } else { None },
+        field: 0,
     })
 }
 
@@ -98,7 +123,7 @@ trait DeRecord<'r> {
     ) -> Result<V::Value, DeserializeError>;
 }
 
-struct DeRecordWrap<T>(T);
+pub struct DeRecordWrap<T>(T);
 
 impl<'r, T: DeRecord<'r>> DeRecord<'r> for DeRecordWrap<T> {
     #[inline]
@@ -144,6 +169,86 @@ impl<'r, T: DeRecord<'r>> DeRecord<'r> for DeRecordWrap<T> {
         visitor: V,
     ) -> Result<V::Value, DeserializeError> {
         self.0.infer_deserialize(visitor)
+    }
+}
+
+pub struct DeStringRecords<'r, R: io::Read> {
+    its: iter::Peekable<StringRecordsIntoIter<R>>,
+    it: iter::Peekable<StringRecordIter<'r>>,
+    headers: Option<StringRecordIter<'r>>,
+    rec: Option<StringRecord>,
+    field: u64,
+}
+
+impl<'r, R: io::Read> DeRecord<'r> for DeStringRecords<'r,R> {
+    #[inline]
+    fn has_headers(&self) -> bool {
+        self.headers.is_some()
+    }
+
+    #[inline]
+    fn next_header(&mut self) -> Result<Option<&'r str>, DeserializeError> {
+        Ok(self.headers.as_mut().and_then(|it| it.next()))
+    }
+
+    #[inline]
+    fn next_header_bytes(
+        &mut self,
+    ) -> Result<Option<&'r [u8]>, DeserializeError> {
+        Ok(self.next_header()?.map(|s| s.as_bytes()))
+    }
+
+    #[inline]
+    fn next_field(&mut self) -> Result<&'r str, DeserializeError> {
+        update_rec();
+        match self.it.next() {
+            Some(field) => {
+                self.field += 1;
+                Ok(field)
+            }
+            None => Err(DeserializeError {
+                field: None,
+                kind: DEK::UnexpectedEndOfRow,
+            })
+        }
+    }
+
+    #[inline]
+    fn next_field_bytes(&mut self) -> Result<&'r [u8], DeserializeError> {
+        self.next_field().map(|s| s.as_bytes())
+    }
+
+    #[inline]
+    fn peek_field(&mut self) -> Option<&'r [u8]> {
+        update_rec();
+        self.it.peek().map(|s| s.as_bytes())
+    }
+
+    fn error(&self, kind: DeserializeErrorKind) -> DeserializeError {
+        DeserializeError {
+            field: Some(self.field.saturating_sub(1)),
+            kind: kind,
+        }
+    }
+
+    fn infer_deserialize<'de, V: Visitor<'de>>(
+        &mut self,
+        visitor: V,
+    ) -> Result<V::Value, DeserializeError> {
+        let x = self.next_field()?;
+        if x == "true" {
+            visitor.visit_bool(true)
+        } else if x == "false" {
+            visitor.visit_bool(false)
+        } else if let Some(n) = try_positive_integer(x) {
+            visitor.visit_u64(n)
+        } else if let Some(n) = try_negative_integer(x) {
+            visitor.visit_i64(n)
+        } else if let Some(n) = try_float(x) {
+            visitor.visit_f64(n)
+        } else {
+            visitor.visit_str(x)
+        }
     }
 }
 
